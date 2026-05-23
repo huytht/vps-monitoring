@@ -3,12 +3,13 @@
 import useSWR from 'swr';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   ArrowLeft,
   Cpu,
   HardDrive,
   Loader2,
+  Logs,
   MemoryStick,
   Network,
   Pencil,
@@ -23,6 +24,7 @@ import { UsageBar } from '@/components/UsageBar';
 import { MetricChart } from '@/components/MetricChart';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { RenameServerDialog } from '@/components/RenameServerDialog';
+import { ModalFrame } from '@/components/ModalFrame';
 import { formatBps, formatBytes, formatUptime, percent, timeAgo } from '@/lib/utils';
 
 interface AgentDetail {
@@ -73,6 +75,28 @@ interface MetricPoint {
   loadAvg1: number;
 }
 
+interface DockerContainer {
+  containerId: string;
+  name: string;
+  image: string;
+  state: string;
+  status: string;
+  cpuPercent?: number;
+  memUsage?: string;
+  memPercent?: number;
+  netIO?: string;
+  blockIO?: string;
+  pids?: number;
+  ts: string;
+}
+
+interface ContainerLogPayload {
+  containerId: string;
+  name: string;
+  ts: string;
+  logTail: string;
+}
+
 const fetcher = (url: string) => fetch(url).then((r) => r.json());
 
 const RANGES = [
@@ -87,6 +111,14 @@ export function ServerDetailClient({ agentId }: { agentId: string }) {
   const [range, setRange] = useState('1h');
   const [renameOpen, setRenameOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [logOpen, setLogOpen] = useState(false);
+  const [logLoading, setLogLoading] = useState(false);
+  const [logSearch, setLogSearch] = useState('');
+  const [logDataList, setLogDataList] = useState<ContainerLogPayload[]>([]);
+  const [activeLogContainerIds, setActiveLogContainerIds] = useState<string[]>([]);
+  const [selectedContainerIds, setSelectedContainerIds] = useState<string[]>([]);
+  const [autoScrollOnNextLoad, setAutoScrollOnNextLoad] = useState(false);
+  const logPanelRefs = useRef<Record<string, HTMLPreElement | null>>({});
 
   const { data, isLoading, mutate } = useSWR<{ agent: AgentDetail }>(
     `/api/agents/${agentId}`,
@@ -98,9 +130,114 @@ export function ServerDetailClient({ agentId }: { agentId: string }) {
     fetcher,
     { refreshInterval: 10000 }
   );
+  const { data: dockerData, isLoading: loadingDocker, mutate: mutateDocker } = useSWR<{
+    containers: DockerContainer[];
+  }>(`/api/agents/${agentId}/containers`, fetcher, { refreshInterval: 10000 });
 
   const agent = data?.agent;
   const metrics = metricsData?.metrics ?? [];
+  const containers = dockerData?.containers ?? [];
+  const sortedContainers = [...containers].sort((a, b) => {
+    const ar = a.state === 'running' ? 0 : 1;
+    const br = b.state === 'running' ? 0 : 1;
+    if (ar !== br) return ar - br;
+    const an = (a.name || '').toLowerCase();
+    const bn = (b.name || '').toLowerCase();
+    const byName = an.localeCompare(bn);
+    if (byName !== 0) return byName;
+    return a.containerId.localeCompare(b.containerId);
+  });
+
+  const fetchLogsForContainers = async (containerIds: string[]) => {
+    const uniqueIds = Array.from(new Set(containerIds));
+    if (!uniqueIds.length) return;
+    const results = await Promise.all(
+      uniqueIds.map(async (containerId) => {
+        const res = await fetch(`/api/agents/${agentId}/containers/${containerId}/logs`);
+        if (!res.ok) throw new Error(`Failed to load logs for ${containerId.slice(0, 12)}`);
+        return (await res.json()) as ContainerLogPayload;
+      })
+    );
+    const order = new Map(uniqueIds.map((id, idx) => [id, idx]));
+    return results.sort(
+      (a, b) => (order.get(a.containerId) ?? 0) - (order.get(b.containerId) ?? 0)
+    );
+  };
+
+  const loadLogs = async (containerIds: string[]) => {
+    const uniqueIds = Array.from(new Set(containerIds));
+    if (!uniqueIds.length) return;
+    setLogLoading(true);
+    setLogOpen(true);
+    setLogSearch('');
+    setLogDataList([]);
+    setAutoScrollOnNextLoad(true);
+    setActiveLogContainerIds(uniqueIds);
+    try {
+      const results = await fetchLogsForContainers(uniqueIds);
+      if (!results) throw new Error('No logs loaded');
+      setLogDataList(results);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Failed to load logs');
+      setLogOpen(false);
+    } finally {
+      setLogLoading(false);
+    }
+  };
+
+  const scrollAllLogsToBottom = () => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        for (const item of logDataList) {
+          const el = logPanelRefs.current[item.containerId];
+          if (el) el.scrollTop = el.scrollHeight;
+        }
+      });
+    });
+  };
+
+  useEffect(() => {
+    if (!autoScrollOnNextLoad || !logDataList.length) return;
+    scrollAllLogsToBottom();
+    setAutoScrollOnNextLoad(false);
+  }, [autoScrollOnNextLoad, logDataList]);
+
+  useEffect(() => {
+    if (!logOpen || !activeLogContainerIds.length) return;
+    const timer = setInterval(async () => {
+      try {
+        const results = await fetchLogsForContainers(activeLogContainerIds);
+        if (results) setLogDataList(results);
+      } catch {
+        // Keep last rendered logs; user can still manually refresh page.
+      }
+    }, 3000);
+    return () => clearInterval(timer);
+  }, [logOpen, activeLogContainerIds]);
+
+  const openLogs = async (containerId: string) => {
+    await loadLogs([containerId]);
+  };
+
+  const openSelectedLogs = async () => {
+    if (!selectedContainerIds.length) {
+      toast.error('Select at least one container');
+      return;
+    }
+    await loadLogs(selectedContainerIds);
+  };
+
+  const toggleContainer = (containerId: string) => {
+    setSelectedContainerIds((prev) =>
+      prev.includes(containerId) ? prev.filter((x) => x !== containerId) : [...prev, containerId]
+    );
+  };
+
+  const toggleAllContainers = () => {
+    setSelectedContainerIds((prev) =>
+      prev.length === sortedContainers.length ? [] : sortedContainers.map((c) => c.containerId)
+    );
+  };
 
   const performDelete = async () => {
     const res = await fetch(`/api/agents/${agentId}`, { method: 'DELETE' });
@@ -124,6 +261,14 @@ export function ServerDetailClient({ agentId }: { agentId: string }) {
     }
     toast.success('Updated');
     mutate();
+  };
+
+  const getFilteredLog = (raw: string): string => {
+    const q = logSearch.trim().toLowerCase();
+    if (!q) return raw;
+    const lines = raw.split('\n');
+    const matched = lines.filter((line) => line.toLowerCase().includes(q));
+    return matched.length ? matched.join('\n') : '(no matching lines)';
   };
 
   if (isLoading && !agent) {
@@ -196,7 +341,13 @@ export function ServerDetailClient({ agentId }: { agentId: string }) {
         </div>
 
         <div className="flex items-center gap-2">
-          <button onClick={() => mutate()} className="btn-secondary">
+          <button
+            onClick={() => {
+              mutate();
+              mutateDocker();
+            }}
+            className="btn-secondary"
+          >
             <RefreshCw className="h-4 w-4" />
             Refresh
           </button>
@@ -240,6 +391,100 @@ export function ServerDetailClient({ agentId }: { agentId: string }) {
           sub={`↑ ${formatBps(latest?.netTxBps ?? 0)}`}
           pct={Math.min(100, ((latest?.netRxBps ?? 0) + (latest?.netTxBps ?? 0)) / 10_000_000)}
         />
+      </div>
+
+      <div className="card overflow-hidden">
+        <div className="flex items-center justify-between border-b border-border px-5 py-4">
+          <div>
+            <h2 className="text-base font-semibold text-ink">Docker containers</h2>
+            <p className="text-xs text-ink-soft">
+              {loadingDocker ? 'Loading…' : `${containers.length} container${containers.length === 1 ? '' : 's'}`}
+            </p>
+          </div>
+          <button
+            className="btn-secondary"
+            onClick={openSelectedLogs}
+            disabled={!selectedContainerIds.length}
+          >
+            <Logs className="h-4 w-4" />
+            View selected logs ({selectedContainerIds.length})
+          </button>
+        </div>
+        {loadingDocker ? (
+          <div className="space-y-2 p-5">{[0, 1, 2].map((i) => <div key={i} className="skeleton h-14 w-full" />)}</div>
+        ) : containers.length === 0 ? (
+          <div className="px-6 py-10 text-sm text-ink-muted">
+            No container stats received yet. Ensure Docker is installed and wait for next heartbeat.
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="border-b border-border bg-bg-soft/40 text-left text-[11px] uppercase tracking-wider text-ink-soft">
+                <tr>
+                  <th className="px-3 py-3 font-medium">
+                    <input
+                      type="checkbox"
+                      className="h-4 w-4"
+                      checked={
+                        sortedContainers.length > 0 &&
+                        selectedContainerIds.length === sortedContainers.length
+                      }
+                      onChange={toggleAllContainers}
+                      aria-label="Select all containers"
+                    />
+                  </th>
+                  <th className="px-5 py-3 font-medium">Container</th>
+                  <th className="px-3 py-3 font-medium">State</th>
+                  <th className="px-3 py-3 font-medium">CPU</th>
+                  <th className="px-3 py-3 font-medium">Memory</th>
+                  <th className="px-3 py-3 font-medium">Net I/O</th>
+                  <th className="px-3 py-3 font-medium">Block I/O</th>
+                  <th className="px-3 py-3 font-medium">PIDs</th>
+                  <th className="px-3 py-3 font-medium">Updated</th>
+                  <th className="px-3 py-3 font-medium text-right">Logs</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-border">
+                {sortedContainers.map((c) => (
+                  <tr key={c.containerId} className="hover:bg-bg-soft/30">
+                    <td className="px-3 py-3">
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4"
+                        checked={selectedContainerIds.includes(c.containerId)}
+                        onChange={() => toggleContainer(c.containerId)}
+                        aria-label={`Select ${c.name || c.containerId.slice(0, 12)}`}
+                      />
+                    </td>
+                    <td className="px-5 py-3">
+                      <div className="font-medium text-ink">{c.name || c.containerId.slice(0, 12)}</div>
+                      <div className="text-xs text-ink-soft">{c.image}</div>
+                    </td>
+                    <td className="px-3 py-3">
+                      <span className={`chip text-[10px] ${c.state === 'running' ? 'chip-success' : 'chip-muted'}`}>
+                        {c.state || 'unknown'}
+                      </span>
+                      <div className="mt-1 text-[11px] text-ink-soft">{c.status}</div>
+                    </td>
+                    <td className="px-3 py-3">{typeof c.cpuPercent === 'number' ? `${c.cpuPercent.toFixed(2)}%` : 'n/a'}</td>
+                    <td className="px-3 py-3">{c.memUsage || 'n/a'}{typeof c.memPercent === 'number' ? ` (${c.memPercent.toFixed(1)}%)` : ''}</td>
+                    <td className="px-3 py-3">{c.netIO || 'n/a'}</td>
+                    <td className="px-3 py-3">{c.blockIO || 'n/a'}</td>
+                    <td className="px-3 py-3">{typeof c.pids === 'number' ? c.pids : 'n/a'}</td>
+                    <td className="px-3 py-3 text-xs text-ink-muted">{timeAgo(c.ts)}</td>
+                    <td className="px-3 py-3">
+                      <div className="flex justify-end gap-2">
+                        <button className="btn-secondary" onClick={() => openLogs(c.containerId)}>
+                          <Logs className="h-4 w-4" />View
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
 
       <div className="card overflow-hidden">
@@ -415,6 +660,107 @@ export function ServerDetailClient({ agentId }: { agentId: string }) {
         tone="danger"
         onConfirm={performDelete}
       />
+      <ModalFrame
+        open={logOpen}
+        onClose={() => {
+          setLogOpen(false);
+          setActiveLogContainerIds([]);
+          setLogDataList([]);
+        }}
+        contentClassName="max-w-[min(98vw,1800px)]"
+      >
+        <div className="card mx-auto flex max-h-[92vh] w-full flex-col overflow-hidden rounded-2xl border border-border bg-bg-card shadow-2xl">
+          <div className="flex items-center justify-between border-b border-border px-5 py-3">
+            <h3 className="text-sm font-semibold text-ink">
+              Container logs ({logDataList.length})
+            </h3>
+            <div className="flex items-center gap-2">
+              <input
+                className="input h-9 w-64 text-sm"
+                placeholder="Search in logs…"
+                value={logSearch}
+                onChange={(e) => setLogSearch(e.target.value)}
+              />
+              <button
+                className="btn-secondary"
+                onClick={async () => {
+                  if (!activeLogContainerIds.length) return;
+                  setAutoScrollOnNextLoad(true);
+                  setLogLoading(true);
+                  try {
+                    const results = await fetchLogsForContainers(activeLogContainerIds);
+                    if (results) {
+                      setLogDataList(results);
+                      requestAnimationFrame(() => {
+                        requestAnimationFrame(() => {
+                          for (const item of results) {
+                            const el = logPanelRefs.current[item.containerId];
+                            if (el) el.scrollTop = el.scrollHeight;
+                          }
+                        });
+                      });
+                    }
+                  } catch {
+                    toast.error('Failed to refresh logs');
+                  } finally {
+                    setLogLoading(false);
+                  }
+                }}
+                disabled={logLoading || !activeLogContainerIds.length}
+              >
+                <RefreshCw className="h-4 w-4" />
+                Fetch now
+              </button>
+              <button
+                className="btn-secondary"
+                onClick={() => {
+                  setLogOpen(false);
+                  setActiveLogContainerIds([]);
+                  setLogDataList([]);
+                }}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+          <div className="min-h-0 overflow-auto p-4">
+            {logLoading ? (
+              <div className="text-sm text-ink-muted">Loading logs…</div>
+            ) : (
+              <div className="grid grid-cols-1 gap-4 2xl:grid-cols-2">
+                {logDataList.map((log) => (
+                  <div key={log.containerId} className="rounded-lg border border-border bg-bg-soft/30">
+                    <div className="flex items-center justify-between border-b border-border px-3 py-2">
+                      <div>
+                        <p className="text-sm font-semibold text-ink">
+                          {log.name || log.containerId.slice(0, 12)}
+                        </p>
+                        <p className="text-[11px] text-ink-soft">Snapshot {timeAgo(log.ts)}</p>
+                      </div>
+                      <a
+                        className="btn-secondary"
+                        href={`/api/agents/${agentId}/containers/${log.containerId}/logs?download=1`}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        Download
+                      </a>
+                    </div>
+                    <pre
+                      ref={(el) => {
+                        logPanelRefs.current[log.containerId] = el;
+                      }}
+                      className="max-h-[56vh] overflow-auto p-3 text-xs leading-relaxed text-ink-muted"
+                    >
+                      {getFilteredLog(log.logTail || '(no logs)')}
+                    </pre>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </ModalFrame>
     </div>
   );
 }
@@ -434,19 +780,15 @@ function GaugeCard({
 }) {
   return (
     <div className="card card-pad">
-      <div className="flex items-start justify-between">
-        <div className="min-w-0">
-          <div className="text-xs font-medium uppercase tracking-wider text-ink-soft">{label}</div>
-          <div className="mt-1 truncate text-2xl font-semibold tracking-tight text-ink">
-            {value}
-          </div>
-          <div className="mt-1 truncate text-xs text-ink-soft">{sub}</div>
-        </div>
-        <div className="flex h-10 w-10 items-center justify-center rounded-xl border border-border bg-bg-muted text-ink-muted">
-          <Icon className="h-5 w-5" />
-        </div>
+      <div className="flex items-center gap-2 text-ink-soft">
+        <Icon className="h-4 w-4" />
+        <span className="text-xs uppercase tracking-wider">{label}</span>
       </div>
-      <UsageBar value={pct} className="mt-4" />
+      <div className="mt-2 text-2xl font-semibold text-ink">{value}</div>
+      <div className="mt-1 text-xs text-ink-muted">{sub}</div>
+      <div className="mt-3">
+        <UsageBar value={pct} />
+      </div>
     </div>
   );
 }
@@ -457,14 +799,14 @@ function ChartCard({
   children,
 }: {
   title: string;
-  hint?: string;
+  hint: string;
   children: React.ReactNode;
 }) {
   return (
-    <div className="rounded-xl border border-border bg-bg-soft/40 p-4">
-      <div className="mb-3 flex items-center justify-between">
-        <h4 className="text-sm font-semibold text-ink">{title}</h4>
-        {hint && <span className="text-xs text-ink-soft">{hint}</span>}
+    <div className="rounded-xl border border-border p-3">
+      <div className="mb-2 flex items-center justify-between">
+        <h3 className="text-sm font-semibold text-ink">{title}</h3>
+        <span className="text-[11px] text-ink-soft">{hint}</span>
       </div>
       {children}
     </div>
@@ -474,16 +816,16 @@ function ChartCard({
 function Row({
   label,
   value,
-  mono,
+  mono = false,
 }: {
   label: string;
   value: React.ReactNode;
   mono?: boolean;
 }) {
   return (
-    <div className="flex flex-col gap-0.5">
+    <div>
       <dt className="text-[11px] uppercase tracking-wider text-ink-soft">{label}</dt>
-      <dd className={`truncate text-ink ${mono ? 'font-mono text-sm' : ''}`}>{value}</dd>
+      <dd className={`mt-0.5 text-ink ${mono ? 'font-mono text-xs' : ''}`}>{value}</dd>
     </div>
   );
 }

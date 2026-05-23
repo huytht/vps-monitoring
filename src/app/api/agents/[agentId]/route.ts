@@ -3,6 +3,8 @@ import { z } from 'zod';
 import { connectDB } from '@/lib/db';
 import { Agent } from '@/lib/models/Agent';
 import { Metric } from '@/lib/models/Metric';
+import { DockerContainerSnapshot } from '@/lib/models/DockerContainerSnapshot';
+import { DockerContainerLog } from '@/lib/models/DockerContainerLog';
 import { getSessionFromCookies } from '@/lib/auth';
 import { env } from '@/lib/env';
 
@@ -84,6 +86,8 @@ export async function DELETE(_req: Request, { params }: RouteContext) {
   await connectDB();
   await Agent.deleteOne({ agentId: params.agentId });
   await Metric.deleteMany({ agentId: params.agentId });
+  await DockerContainerSnapshot.deleteMany({ agentId: params.agentId });
+  await DockerContainerLog.deleteMany({ agentId: params.agentId });
 
   return NextResponse.json({ ok: true });
 }

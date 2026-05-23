@@ -148,6 +148,10 @@ CONFIG_FILE="/opt/vps-monitor-agent/agent.conf"
 
 PREV_RX=0; PREV_TX=0; PREV_TS=0
 PREV_CPU_TOTAL=0; PREV_CPU_IDLE=0
+LOG_UPLOAD_LOCK="/tmp/vps-monitor-log-upload.lock"
+LOG_UPLOAD_MAX_CONTAINERS=4
+LOG_UPLOAD_TAIL_LINES=5000
+LOG_UPLOAD_MAX_BYTES=1000000
 
 read_cpu() {
   read -r _ user nice system idle iowait irq softirq steal _ < /proc/stat
@@ -237,6 +241,54 @@ while true; do
   # Process count
   PROC_COUNT=$(ls -1 /proc 2>/dev/null | grep -c '^[0-9][0-9]*$')
 
+  DOCKER_AVAILABLE=false
+  DOCKER_CONTAINERS='[]'
+  if command -v docker >/dev/null 2>&1; then
+    if docker info >/dev/null 2>&1; then
+      DOCKER_AVAILABLE=true
+      DOCKER_CONTAINERS='[]'
+      while IFS='|' read -r CID CNAME CIMAGE CSTATE CSTATUS; do
+        [ -z "$CID" ] && continue
+        STATS_JSON="$(docker stats --no-stream --format '{{json .}}' "$CID" 2>/dev/null || true)"
+
+        C_CPU_PERCENT=""
+        MEM_USAGE=""
+        C_MEM_PERCENT=""
+        NET_IO=""
+        BLOCK_IO=""
+        C_PIDS=""
+
+        if [ -n "$STATS_JSON" ]; then
+          C_CPU_PERCENT="$(echo "$STATS_JSON" | jq -r '.CPUPerc // ""' | tr -d '%')"
+          MEM_USAGE="$(echo "$STATS_JSON" | jq -r '.MemUsage // ""')"
+          C_MEM_PERCENT="$(echo "$STATS_JSON" | jq -r '.MemPerc // ""' | tr -d '%')"
+          NET_IO="$(echo "$STATS_JSON" | jq -r '.NetIO // ""')"
+          BLOCK_IO="$(echo "$STATS_JSON" | jq -r '.BlockIO // ""')"
+          C_PIDS="$(echo "$STATS_JSON" | jq -r '.PIDs // ""')"
+        fi
+
+        ITEM="$(jq -n \
+          --arg containerId "$CID" \
+          --arg name "$CNAME" \
+          --arg image "$CIMAGE" \
+          --arg state "$CSTATE" \
+          --arg status "$CSTATUS" \
+          --arg memUsage "$MEM_USAGE" \
+          --arg netIO "$NET_IO" \
+          --arg blockIO "$BLOCK_IO" \
+          --arg cpuPercent "$C_CPU_PERCENT" \
+          --arg memPercent "$C_MEM_PERCENT" \
+          --arg pids "$C_PIDS" \
+          '{containerId:$containerId,name:$name,image:$image,state:$state,status:$status,memUsage:$memUsage,netIO:$netIO,blockIO:$blockIO}
+           + (if ($cpuPercent|length)>0 then {cpuPercent:($cpuPercent|tonumber)} else {} end)
+           + (if ($memPercent|length)>0 then {memPercent:($memPercent|tonumber)} else {} end)
+           + (if ($pids|length)>0 then {pids:($pids|tonumber)} else {} end)')"
+        DOCKER_CONTAINERS="$(jq -c --argjson item "$ITEM" '. + [$item]' <<< "$DOCKER_CONTAINERS")"
+
+      done < <(docker ps -a --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.State}}|{{.Status}}')
+    fi
+  fi
+
   PAYLOAD=$(jq -n \
     --arg agentId "$AGENT_ID" \
     --arg token   "$AGENT_TOKEN" \
@@ -256,11 +308,40 @@ while true; do
     --argjson netTxBps   "$TX_BPS" \
     --argjson uptimeSeconds "$UPTIME" \
     --argjson processCount  "$PROC_COUNT" \
-    '{agentId:$agentId, token:$token, cpuPercent:$cpuPercent, loadAvg1:$loadAvg1, loadAvg5:$loadAvg5, loadAvg15:$loadAvg15, memUsedBytes:$memUsedBytes, memTotalBytes:$memTotalBytes, swapUsedBytes:$swapUsedBytes, swapTotalBytes:$swapTotalBytes, diskUsedBytes:$diskUsedBytes, diskTotalBytes:$diskTotalBytes, netRxBytes:$netRxBytes, netTxBytes:$netTxBytes, netRxBps:$netRxBps, netTxBps:$netTxBps, uptimeSeconds:$uptimeSeconds, processCount:$processCount}')
+    --argjson dockerAvailable "$DOCKER_AVAILABLE" \
+    --argjson dockerContainers "$DOCKER_CONTAINERS" \
+    '{agentId:$agentId, token:$token, cpuPercent:$cpuPercent, loadAvg1:$loadAvg1, loadAvg5:$loadAvg5, loadAvg15:$loadAvg15, memUsedBytes:$memUsedBytes, memTotalBytes:$memTotalBytes, swapUsedBytes:$swapUsedBytes, swapTotalBytes:$swapTotalBytes, diskUsedBytes:$diskUsedBytes, diskTotalBytes:$diskTotalBytes, netRxBytes:$netRxBytes, netTxBytes:$netTxBytes, netRxBps:$netRxBps, netTxBps:$netTxBps, uptimeSeconds:$uptimeSeconds, processCount:$processCount, dockerAvailable:$dockerAvailable, dockerContainers:$dockerContainers}')
 
-  curl -fsS --max-time 10 -X POST "$SERVER_URL/api/agents/heartbeat" \
+  curl -fsS --max-time 12 -X POST "$SERVER_URL/api/agents/heartbeat" \
     -H 'Content-Type: application/json' \
     -d "$PAYLOAD" >/dev/null 2>&1 || true
+
+  # Upload logs in background so heartbeat timing is not blocked by heavy containers.
+  if [ "$DOCKER_AVAILABLE" = "true" ]; then
+    (
+      exec 9>"$LOG_UPLOAD_LOCK"
+      flock -n 9 || exit 0
+      count=0
+      while IFS='|' read -r CID CNAME; do
+        [ -z "$CID" ] && continue
+        [ "$count" -ge "$LOG_UPLOAD_MAX_CONTAINERS" ] && break
+        LOG_TMP="$(mktemp)"
+        docker logs --tail "$LOG_UPLOAD_TAIL_LINES" "$CID" 2>&1 | head -c "$LOG_UPLOAD_MAX_BYTES" | tr -d '\000' > "$LOG_TMP" 2>/dev/null || true
+        jq -n \
+          --arg agentId "$AGENT_ID" \
+          --arg token "$AGENT_TOKEN" \
+          --arg containerId "$CID" \
+          --arg name "$CNAME" \
+          --rawfile logTail "$LOG_TMP" \
+          '{agentId:$agentId, token:$token, containerId:$containerId, name:$name, logTail:$logTail}' \
+          | curl -fsS --max-time 6 -X POST "$SERVER_URL/api/agents/container-log" \
+            -H 'Content-Type: application/json' \
+            --data-binary @- >/dev/null 2>&1 || true
+        rm -f "$LOG_TMP"
+        count=$((count + 1))
+      done < <(docker ps -a --format '{{.ID}}|{{.Names}}')
+    ) >/dev/null 2>&1 &
+  fi
 
   sleep "$INTERVAL"
 done

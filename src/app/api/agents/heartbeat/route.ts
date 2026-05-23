@@ -5,10 +5,26 @@ import { connectDB } from '@/lib/db';
 import { env } from '@/lib/env';
 import { Agent } from '@/lib/models/Agent';
 import { Metric } from '@/lib/models/Metric';
+import { DockerContainerSnapshot } from '@/lib/models/DockerContainerSnapshot';
+import { DockerContainerLog } from '@/lib/models/DockerContainerLog';
 import { sendTelegramOverloadIfNeeded } from '@/lib/telegram-alerts';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+
+const dockerContainerSchema = z.object({
+  containerId: z.string().min(1).max(128),
+  name: z.string().max(256).default(''),
+  image: z.string().max(512).default(''),
+  state: z.string().max(64).default(''),
+  status: z.string().max(256).default(''),
+  cpuPercent: z.number().min(0).max(1000).optional(),
+  memUsage: z.string().max(128).default(''),
+  memPercent: z.number().min(0).max(1000).optional(),
+  netIO: z.string().max(128).default(''),
+  blockIO: z.string().max(128).default(''),
+  pids: z.number().int().min(0).max(100000).optional(),
+});
 
 const schema = z.object({
   agentId: z.string().min(1),
@@ -29,6 +45,8 @@ const schema = z.object({
   netTxBps: z.number().min(0).default(0),
   uptimeSeconds: z.number().min(0).default(0),
   processCount: z.number().int().min(0).default(0),
+  dockerAvailable: z.boolean().optional(),
+  dockerContainers: z.array(dockerContainerSchema).max(200).optional(),
 });
 
 export async function POST(req: Request) {
@@ -73,6 +91,45 @@ export async function POST(req: Request) {
     uptimeSeconds: parsed.data.uptimeSeconds,
     processCount: parsed.data.processCount,
   });
+
+  if (parsed.data.dockerAvailable && parsed.data.dockerContainers) {
+    const containerIds = parsed.data.dockerContainers.map((c) => c.containerId);
+
+    await Promise.all(
+      parsed.data.dockerContainers.map((c) =>
+        DockerContainerSnapshot.updateOne(
+          { agentId: agent.agentId, containerId: c.containerId },
+          {
+            $set: {
+              agentId: agent.agentId,
+              containerId: c.containerId,
+              name: c.name,
+              image: c.image,
+              state: c.state,
+              status: c.status,
+              cpuPercent: c.cpuPercent,
+              memUsage: c.memUsage,
+              memPercent: c.memPercent,
+              netIO: c.netIO,
+              blockIO: c.blockIO,
+              pids: c.pids,
+              ts: now,
+            },
+          },
+          { upsert: true }
+        )
+      )
+    );
+
+    await DockerContainerSnapshot.deleteMany({
+      agentId: agent.agentId,
+      containerId: { $nin: containerIds },
+    });
+    await DockerContainerLog.deleteMany({
+      agentId: agent.agentId,
+      containerId: { $nin: containerIds },
+    });
+  }
 
   const appSettings = await getAppSettings();
   const sent = await sendTelegramOverloadIfNeeded(

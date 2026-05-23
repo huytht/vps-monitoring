@@ -9,12 +9,14 @@ export function ModalFrame({
   children,
   labelledBy,
   describedBy,
+  contentClassName,
 }: {
   open: boolean;
   onClose: () => void;
   children: React.ReactNode;
   labelledBy?: string;
   describedBy?: string;
+  contentClassName?: string;
 }) {
   useEffect(() => {
     if (!open) return;
@@ -33,7 +35,7 @@ export function ModalFrame({
   if (!open || typeof document === 'undefined') return null;
 
   return createPortal(
-    <div className="fixed inset-0 z-[200] flex items-center justify-center p-4 sm:p-6">
+    <div className="fixed inset-0 z-[200] flex items-start justify-center overflow-y-auto p-4 sm:items-center sm:p-6">
       <button
         type="button"
         className="absolute inset-0 bg-black/55 backdrop-blur-[1px] transition-opacity dark:bg-black/65"
@@ -45,7 +47,7 @@ export function ModalFrame({
         aria-modal="true"
         aria-labelledby={labelledBy}
         aria-describedby={describedBy}
-        className="relative z-10 w-full max-w-md animate-fade-in"
+        className={`relative z-10 w-full animate-fade-in ${contentClassName ?? 'max-w-md'}`}
         onClick={(e) => e.stopPropagation()}
       >
         {children}

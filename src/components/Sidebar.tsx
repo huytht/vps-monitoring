@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { LayoutDashboard, Server, Settings, LogOut, BookOpen } from 'lucide-react';
+import { LayoutDashboard, Server, Settings, LogOut, BookOpen, Database } from 'lucide-react';
 import { Logo } from './Logo';
 import { ThemeToggle } from './ThemeToggle';
 import { cn } from '@/lib/utils';
@@ -12,6 +12,7 @@ import { useRouter } from 'next/navigation';
 const NAV = [
   { href: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { href: '/servers', label: 'Servers', icon: Server },
+  { href: '/monitors', label: 'Monitors', icon: Database },
   { href: '/settings', label: 'Settings', icon: Settings },
 ];
 
